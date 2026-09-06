@@ -1,0 +1,3 @@
+Asuswrt-Merlin AdGuard DoQ/DoT Policy Router over WireGuard
+
+A lightweight, automated policy-routing solution for Asuswrt-Merlin routers. This tool selectively routes encrypted DNS queries (DNS-over-QUIC / UDP 853 and DNS-over-TLS / TCP 853) bound for AdGuard DNS through a local WireGuard tunnel (e.g., Mullvad Istanbul). It fixes severe ISP Anycast routing latency while avoiding the hardware acceleration penalties and upload speed collapse caused by Asuswrt-Merlin's native VPN Director.
