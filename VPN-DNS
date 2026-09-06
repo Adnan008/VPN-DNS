@@ -1,0 +1,197 @@
+#!/bin/sh
+# ==============================================================================
+# Owner: Adnan008
+# Note: Created with the assistance of Gemini, ChatGPT, and Claude.
+#
+# Description: This script sets up the necessary firewall rules, routing 
+# tables, and automatic WAN failover mechanisms to route both AdGuard 
+# DNS-over-QUIC (DoQ / UDP Port 853) and DNS-over-TLS (DoT / TCP Port 853) 
+# traffic through a WireGuard (wgc1) tunnel on Asuswrt-Merlin routers.
+# ==============================================================================
+
+set -u
+BASE="/jffs/scripts"; CONF="$BASE/vpn-dns.conf"
+
+# --- 1. Configuration File (vpn-dns.conf) ---
+# IP addresses, WireGuard interface, and firewall variables are stored in this file.
+cat > "$CONF" <<'EOF'
+DNS1="94.140.14.49"     # Primary AdGuard DNS address
+DNS2="94.140.14.59"     # Secondary AdGuard DNS address
+WG_IF="wgc1"            # WireGuard Client 1 interface where traffic will be routed
+FWMARK="0x8000"         # iptables mark value to be used for packets
+FWMASK="0x8000"         # Mark mask
+RTABLE="111"            # Custom routing table ID to be used for these operations
+RULE_PRIO="10"          # Priority value for the routing rule
+ALLOW_DOT_TCP=1         # Allow DNS-over-TLS (TCP 853) traffic in addition to DoQ (UDP 853)
+MAX_HANDSHAKE_AGE=150   # Maximum accepted time (seconds) to determine if the WireGuard connection is lost
+FW_CHAIN="VPN_DNS_853"  # Name of the custom chain to be created in the firewall
+EOF
+chmod 600 "$CONF"       # Restrict read/write permissions of the file to root only for security
+
+# --- 2. Firewall Rules (vpn-dns-firewall.sh) ---
+# This script adds rules to allow UDP and TCP port 853 traffic for the specified DNS addresses.
+cat > "$BASE/vpn-dns-firewall.sh" <<'EOF'
+#!/bin/sh
+. /jffs/scripts/vpn-dns.conf
+# If FW_CHAIN does not exist, create it and set default incoming action to DROP
+! iptables -n -L "$FW_CHAIN" >/dev/null 2>&1 && { iptables -N "$FW_CHAIN" 2>/dev/null; iptables -A "$FW_CHAIN" -j DROP 2>/dev/null; }
+
+# Allow port 853 (UDP and optionally TCP) for AdGuard DNS addresses
+for D in "$DNS1" "$DNS2"; do
+  ! iptables -C "$FW_CHAIN" -p udp -d "$D" --dport 853 -j ACCEPT 2>/dev/null && iptables -I "$FW_CHAIN" 1 -p udp -d "$D" --dport 853 -j ACCEPT
+  [ "${ALLOW_DOT_TCP:-1}" = "1" ] && ! iptables -C "$FW_CHAIN" -p tcp -d "$D" --dport 853 -j ACCEPT 2>/dev/null && iptables -I "$FW_CHAIN" 1 -p tcp -d "$D" --dport 853 -j ACCEPT
+done
+
+# Redirect port 853 traffic originating from the local network (br+) to our custom chain (FW_CHAIN)
+for P in udp tcp; do
+  [ "$P" = tcp ] && [ "${ALLOW_DOT_TCP:-1}" != "1" ] && continue
+  ! iptables -C FORWARD -i br+ -p "$P" --dport 853 -j "$FW_CHAIN" 2>/dev/null && iptables -I FORWARD 1 -i br+ -p "$P" --dport 853 -j "$FW_CHAIN" 2>/dev/null
+done
+
+# Redirect port 853 traffic originating from the router itself (OUTPUT) to the chain
+! iptables -C OUTPUT -p udp --dport 853 -j "$FW_CHAIN" 2>/dev/null && iptables -I OUTPUT 1 -p udp --dport 853 -j "$FW_CHAIN" 2>/dev/null
+[ "${ALLOW_DOT_TCP:-1}" = "1" ] && ! iptables -C OUTPUT -p tcp --dport 853 -j "$FW_CHAIN" 2>/dev/null && iptables -I OUTPUT 1 -p tcp --dport 853 -j "$FW_CHAIN" 2>/dev/null
+
+# If DNSFILTER is active on the router, allow DoT traffic by bypassing its rules
+if iptables -n -L DNSFILTER_DOT >/dev/null 2>&1; then
+  for D in "$DNS1" "$DNS2"; do
+    ! iptables -C DNSFILTER_DOT -p udp -d "$D" --dport 853 -j ACCEPT 2>/dev/null && iptables -I DNSFILTER_DOT 1 -p udp -d "$D" --dport 853 -j ACCEPT
+    [ "${ALLOW_DOT_TCP:-1}" = "1" ] && ! iptables -C DNSFILTER_DOT -p tcp -d "$D" --dport 853 -j ACCEPT 2>/dev/null && iptables -I DNSFILTER_DOT 1 -p tcp -d "$D" --dport 853 -j ACCEPT
+  done
+fi
+EOF
+chmod +x "$BASE/vpn-dns-firewall.sh" # Make executable
+
+# --- 3. WAN Routing and Cleanup (dns-direct.sh) ---
+# Cleans up DNS traffic routing to flow via normal internet (WAN) when WireGuard VPN closes or crashes.
+cat > "$BASE/dns-direct.sh" <<'EOF'
+#!/bin/sh
+. /jffs/scripts/vpn-dns.conf
+# Delete custom routing rule and table
+while ip rule del fwmark "$FWMARK"/"$FWMASK" lookup "$RTABLE" priority "$RULE_PRIO" 2>/dev/null; do :; done
+ip route flush table "$RTABLE" 2>/dev/null
+
+# Clear all traffic marking (MARK) rules on iptables
+for P in udp tcp; do
+  for D in "$DNS1" "$DNS2"; do
+    while iptables -t mangle -D OUTPUT ! -o "$WG_IF" -p "$P" -d "$D" --dport 853 -j MARK --set-xmark "$FWMARK"/"$FWMASK" 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING -i br+ -p "$P" -d "$D" --dport 853 -j MARK --set-xmark "$FWMARK"/"$FWMASK" 2>/dev/null; do :; done
+  done
+done
+# Clear MASQUERADE (NAT) rule and flush routing cache
+while iptables -t nat -D POSTROUTING -o "$WG_IF" -m mark --mark "$FWMARK"/"$FWMASK" -j MASQUERADE 2>/dev/null; do :; done
+ip route flush cache 2>/dev/null
+EOF
+chmod +x "$BASE/dns-direct.sh"
+
+# --- 4. WireGuard Routing (vpn-dns.sh) ---
+# Forces DNS traffic going to port 853 through the WireGuard tunnel when WireGuard (wgc1) is active.
+cat > "$BASE/vpn-dns.sh" <<'EOF'
+#!/bin/sh
+. /jffs/scripts/vpn-dns.conf
+
+# Prevent concurrent executions using a lock file
+L=/tmp/vpn_dns.lock
+[ -d "$L" ] && { [ "$(( $(date +%s) - $(stat -c %Y "$L" 2>/dev/null || date -r "$L" +%s 2>/dev/null || echo $(date +%s)) ))" -gt 120 ] && rmdir "$L" 2>/dev/null; }
+! mkdir "$L" 2>/dev/null && exit 0
+trap 'rmdir "$L" 2>/dev/null' EXIT INT TERM
+
+# Call basic firewall and cleanup commands
+sh "$BASE/vpn-dns-firewall.sh" >/dev/null 2>&1; sh "$BASE/dns-direct.sh" >/dev/null 2>&1
+
+# Check if the WireGuard interface is active (has received an inet IP)
+! ifconfig "$WG_IF" 2>/dev/null | grep -q "inet " && exit 0
+
+# Change rp_filter mode from Strict to Loose (2) to solve asymmetric routing issues
+sysctl -w "net.ipv4.conf.$WG_IF.rp_filter=2" >/dev/null 2>&1
+
+# Check if rules already exist and prevent conflicts
+ip rule show 2>/dev/null | grep -E "^[[:space:]]*$RULE_PRIO:" | grep -qvE "fwmark $FWMARK/$FWMASK.*lookup $RTABLE" && exit 1
+ip route show table "$RTABLE" 2>/dev/null | grep -v "^default dev $WG_IF" | grep -q . && exit 1
+
+# Add ip rule to direct traffic to the custom table (RTABLE)
+! ip rule show 2>/dev/null | grep -qE "^[[:space:]]*$RULE_PRIO:.*fwmark $FWMARK/$FWMASK.*lookup $RTABLE" && { ip rule add fwmark "$FWMARK"/"$FWMASK" lookup "$RTABLE" priority "$RULE_PRIO" 2>/dev/null || exit 1; }
+
+# Change the default route of the custom table to the WireGuard interface (wgc1)
+! ip route show table "$RTABLE" 2>/dev/null | grep -q "^default dev $WG_IF" && { ip route add default dev "$WG_IF" table "$RTABLE" metric 1 2>/dev/null || { sh "$BASE/dns-direct.sh" >/dev/null 2>&1; exit 1; }; }
+
+# Mark (MARK) traffic originating from the router (OUTPUT) and from the network (PREROUTING)
+for P in udp tcp; do
+  [ "$P" = tcp ] && [ "${ALLOW_DOT_TCP:-1}" != "1" ] && continue
+  for D in "$DNS1" "$DNS2"; do
+    ! iptables -t mangle -C OUTPUT ! -o "$WG_IF" -p "$P" -d "$D" --dport 853 -j MARK --set-xmark "$FWMARK"/"$FWMASK" 2>/dev/null && iptables -t mangle -A OUTPUT ! -o "$WG_IF" -p "$P" -d "$D" --dport 853 -j MARK --set-xmark "$FWMARK"/"$FWMASK"
+    ! iptables -t mangle -C PREROUTING -i br+ -p "$P" -d "$D" --dport 853 -j MARK --set-xmark "$FWMARK"/"$FWMASK" 2>/dev/null && iptables -t mangle -A PREROUTING -i br+ -p "$P" -d "$D" --dport 853 -j MARK --set-xmark "$FWMARK"/"$FWMASK"
+  done
+done
+
+# Add NAT (Masquerade) rule to push marked traffic into the WireGuard tunnel
+! iptables -t nat -C POSTROUTING -o "$WG_IF" -m mark --mark "$FWMARK"/"$FWMASK" -j MASQUERADE 2>/dev/null && iptables -t nat -A POSTROUTING -o "$WG_IF" -m mark --mark "$FWMARK"/"$FWMASK" -j MASQUERADE
+ip route flush cache 2>/dev/null
+EOF
+chmod +x "$BASE/vpn-dns.sh"
+
+# --- 5. Periodic Health Check (vpn-dns-check.sh) ---
+# Regularly checks if WireGuard is healthy using Cron. If the VPN crashes, 
+# it automatically falls back to normal internet (WAN) output (Failover).
+cat > "$BASE/vpn-dns-check.sh" <<'EOF'
+#!/bin/sh
+. /jffs/scripts/vpn-dns.conf
+
+# If firewall rule was deleted, re-add it
+! iptables -n -L "$FW_CHAIN" >/dev/null 2>&1 && sh "$BASE/vpn-dns-firewall.sh" >/dev/null 2>&1
+H=0; NOW=$(date +%s)
+
+# If the interface (wgc1) exists, check the latest handshake time
+if ifconfig "$WG_IF" 2>/dev/null | grep -q "inet "; then
+  while read -r P S; do [ -n "$S" ] && case "$S" in *[!0-9]*|0) ;; *) [ $((NOW-S)) -le "$MAX_HANDSHAKE_AGE" ] && H=1 && break ;; esac; done <<WEOF
+$(wg show "$WG_IF" latest-handshakes 2>/dev/null)
+WEOF
+fi
+
+R1=$(ip rule show 2>/dev/null | grep -qE "^[[:space:]]*$RULE_PRIO:.*fwmark $FWMARK/$FWMASK.*lookup $RTABLE" && echo 1 || echo 0)
+R2=$(ip route show table "$RTABLE" 2>/dev/null | grep -q "^default dev $WG_IF" && echo 1 || echo 0)
+
+# If handshake is fresh (connection active), route via VPN, otherwise switch to WAN and log to Syslog
+if [ "$H" -eq 1 ]; then
+  [ "$R1" -eq 0 ] || [ "$R2" -eq 0 ] && { logger -t VPN-DNS "[RECOVERY] WG UP, Routing via $WG_IF"; sh "$BASE/vpn-dns.sh" >/dev/null 2>&1; }
+else
+  [ "$R1" -eq 1 ] || [ "$R2" -eq 1 ] && { logger -t VPN-DNS "[FAILOVER] WG DOWN, DNS to WAN"; sh "$BASE/dns-direct.sh" >/dev/null 2>&1; }
+fi
+EOF
+chmod +x "$BASE/vpn-dns-check.sh"
+
+# --- 6. System Hooks (firewall, nat, services) ---
+# Hooks are attached to boot scripts so commands execute automatically when the device reboots.
+h(){ [ -f "$1" ] || echo '#!/bin/sh' > "$1"; grep -qF "$2" "$1" 2>/dev/null || echo "$2" >> "$1"; chmod +x "$1"; }
+h "$BASE/firewall-start" 'sh /jffs/scripts/vpn-dns-firewall.sh'
+h "$BASE/nat-start" 'sh /jffs/scripts/vpn-dns-firewall.sh'
+# cru (cron scheduler) is configured to run the check script every minute
+h "$BASE/services-start" "cru d vpn_dns_check 2>/dev/null; cru a vpn_dns_check '* * * * * /jffs/scripts/vpn-dns-check.sh'"
+
+# --- 7. WireGuard Hooks (wgclient-start/stop) ---
+# Ensures scripts are triggered when WireGuard is stopped or started from the interface.
+for f in wgclient-start wgclient-stop; do
+  [ -f "$BASE/$f" ] || echo '#!/bin/sh' > "$BASE/$f"
+  sed -i '/# --- VPN-DNS/,/# --- VPN-DNS END/d' "$BASE/$f" 2>/dev/null
+done
+
+# Startup hook
+cat >> "$BASE/wgclient-start" <<'EOF'
+# --- VPN-DNS
+[ "$1" = "1" ] && { logger -t VPN-DNS "[START] WG Client $1 ON"; sh /jffs/scripts/vpn-dns.sh; }
+# --- VPN-DNS END
+EOF
+
+# Stop hook (return directly to WAN if VPN closes)
+cat >> "$BASE/wgclient-stop" <<'EOF'
+# --- VPN-DNS
+[ "$1" = "1" ] && { logger -t VPN-DNS "[STOP] WG Client $1 OFF"; sh /jffs/scripts/dns-direct.sh; }
+# --- VPN-DNS END
+EOF
+chmod +x "$BASE/wgclient-start" "$BASE/wgclient-stop"
+
+# --- 8. Initialization and Triggering ---
+# Manually trigger everything for the initial setup after all configurations are done.
+sh "$BASE/vpn-dns-firewall.sh" >/dev/null 2>&1
+cru d vpn_dns_check 2>/dev/null; cru a vpn_dns_check '* * * * * /jffs/scripts/vpn-dns-check.sh'
+sh "$BASE/vpn-dns-check.sh" >/dev/null 2>&1
