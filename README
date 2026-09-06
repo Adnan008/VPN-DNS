@@ -1,3 +1,20 @@
 Asuswrt-Merlin AdGuard DoQ/DoT Policy Router over WireGuard
 
 A lightweight, automated policy-routing solution for Asuswrt-Merlin routers. This tool selectively routes encrypted DNS queries (DNS-over-QUIC / UDP 853 and DNS-over-TLS / TCP 853) bound for AdGuard DNS through a local WireGuard tunnel (e.g., Mullvad Istanbul). It fixes severe ISP Anycast routing latency while avoiding the hardware acceleration penalties and upload speed collapse caused by Asuswrt-Merlin's native VPN Director.
+
+The Problem
+
+BGP Anycast Misrouting: Certain ISPs (such as TurkNet) can route AdGuard Anycast IP ranges to overseas data centers (e.g., Brazil) instead of local Turkish exchanges, inflating DNS latency from single digits up to ~250 ms.
+
+The VPN Director Performance Penalty: Using Asuswrt-Merlin's built-in VPN Director to route the destination IP or router traffic through a low-latency local WireGuard exit (such as Mullvad's Istanbul node for ~4 ms resolution) breaks the Flow Cache / Runner hardware acceleration path. Even when Hardware Acceleration displays as active in the WebUI, forcing flows through VPN Director shifts packet inspection to the router CPU, crippling downstream and destroying symmetric upload bandwidth.
+
+The Solution
+
+This utility script circumvents VPN Director entirely:
+Layer-4 Port 853 Packet Tagging: Intercepts only UDP 853 (DoQ) and TCP 853 (DoT) directed at specified DNS IPs. All general LAN bulk traffic, downloads, and uploads remain untouched on the hardware-accelerated fast-path.
+
+Router (OUTPUT) & LAN (PREROUTING) Interception: Captures DNS queries whether generated locally by AdGuard Home on the router or forwarded by network clients.
+
+Dedicated Routing Table: Diverts marked packets into an isolated lookup table (table 111) tied strictly to the WireGuard client interface (wgc1).
+
+Automated WAN Failover via Cron: Continuously monitors live WireGuard handshakes (latest-handshakes). If the tunnel goes down, traffic seamlessly falls back to direct WAN to prevent network outages, automatically restoring tunnel routing once the handshake recovers.
