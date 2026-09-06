@@ -78,8 +78,10 @@ for P in udp tcp; do
     while iptables -t mangle -D PREROUTING -i br+ -p "$P" -d "$D" --dport 853 -j MARK --set-xmark "$FWMARK"/"$FWMASK" 2>/dev/null; do :; done
   done
 done
-# Clear MASQUERADE (NAT) rule and flush routing cache
+# Clear MASQUERADE (NAT) rule, flush conntrack entries and routing cache
 while iptables -t nat -D POSTROUTING -o "$WG_IF" -m mark --mark "$FWMARK"/"$FWMASK" -j MASQUERADE 2>/dev/null; do :; done
+conntrack -D -p udp --dport 853 2>/dev/null
+conntrack -D -p tcp --dport 853 2>/dev/null
 ip route flush cache 2>/dev/null
 EOF
 chmod +x "$BASE/dns-direct.sh"
@@ -126,6 +128,8 @@ done
 
 # Add NAT (Masquerade) rule to push marked traffic into the WireGuard tunnel
 ! iptables -t nat -C POSTROUTING -o "$WG_IF" -m mark --mark "$FWMARK"/"$FWMASK" -j MASQUERADE 2>/dev/null && iptables -t nat -A POSTROUTING -o "$WG_IF" -m mark --mark "$FWMARK"/"$FWMASK" -j MASQUERADE
+conntrack -D -p udp --dport 853 2>/dev/null
+conntrack -D -p tcp --dport 853 2>/dev/null
 ip route flush cache 2>/dev/null
 EOF
 chmod +x "$BASE/vpn-dns.sh"
